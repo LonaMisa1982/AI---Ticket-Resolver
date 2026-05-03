@@ -4,7 +4,16 @@ from pydantic import Field
 from openenv.core.env_server import Action, Observation
 
 class JiraCodeAction(Action):
-    action_type: Literal["read_file", "write_file", "list_files", "run_tests", "submit"]
+    action_type: Literal[
+        "read_file",
+        "write_file",
+        "list_files",
+        "run_tests",
+        "submit",
+        "request_human_review",  # HITL: propose change for human approval (does NOT write to disk)
+        "human_approved",         # HITL: internal — app sends this after human clicks Approve
+        "human_rejected",         # HITL: internal — app sends this after human clicks Reject
+    ]
     file_path: Optional[str] = Field(default=None, description="Path to the file to read or write")
     content: Optional[str] = Field(default=None, description="Code content to write to the file")
 
