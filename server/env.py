@@ -237,6 +237,10 @@ class JiraToCodeEnv(Environment):
         # Populated by the "request_human_review" action; consumed by streamlit_app.py
         self.pending_review: Optional[Dict[str, Any]] = None  # {file_path, original, proposed, diff}
 
+        # Snapshot of original source files (populated at reset) and fixed files (populated on write)
+        self.original_files: Dict[str, str] = {}   # relative_path -> original content
+        self.fixed_files: Dict[str, str] = {}      # relative_path -> fixed content
+
     # ------------------------------------------------------------------
     # Knowledge Base helpers
     # ------------------------------------------------------------------
@@ -375,6 +379,17 @@ class JiraToCodeEnv(Environment):
         else:
             print(f"Warning: Task directory {self.task_source_dir} not found!")
 
+        # Snapshot every non-test Python file so we can show before/after later
+        self.original_files = {}
+        self.fixed_files = {}
+        for py_file in Path(self.workspace_dir).rglob("*.py"):
+            rel = str(py_file.relative_to(self.workspace_dir))
+            if "test_" not in rel and "__pycache__" not in rel:
+                try:
+                    self.original_files[rel] = py_file.read_text()
+                except Exception:
+                    pass
+
         return JiraCodeObservation(
             jira_ticket=self.jira_ticket,
             file_tree=self._get_file_tree(),
@@ -416,71 +431,11 @@ class JiraToCodeEnv(Environment):
                             target_path.parent.mkdir(parents=True, exist_ok=True)
                             target_path.write_text(action.content)
                             current_file_content = action.content
+                            # Track this as a fix for before/after display
+                            self.fixed_files[action.file_path] = action.content
                             reward = 0.05
 
-            # ✅ CHANGE 1 & 4: New action — request_human_review
-            # Agent proposes a change; execution is paused until human approves/rejects.
-            elif action.action_type == "request_human_review":
-                if not action.file_path or action.content is None:
-                    error = "request_human_review requires file_path and content (the proposed fix)."
-                else:
-                    target_path = (workspace_path / action.file_path).resolve()
-                    if not target_path.is_relative_to(workspace_path):
-                        error = "Access denied: cannot access files outside workspace."
-                    else:
-                        original_content = ""
-                        if target_path.exists():
-                            original_content = target_path.read_text()
-
-                        diff_text = self._compute_diff(
-                            original_content, action.content, action.file_path
-                        )
-
-                        # Store pending review for the UI to display
-                        self.pending_review = {
-                            "file_path": action.file_path,
-                            "original": original_content,
-                            "proposed": action.content,
-                            "diff": diff_text,
-                        }
-                        current_file_content = diff_text
-                        reward = 0.02
-                        # Signal to the UI that we are paused
-                        info["awaiting_human_review"] = True
-                        print(
-                            f"[HITL] Agent requested human review for '{action.file_path}'. "
-                            f"Pausing for approval.",
-                            flush=True,
-                        )
-
-            # ✅ CHANGE 4: New action — human_approved (written by Streamlit after approval)
-            elif action.action_type == "human_approved":
-                if self.pending_review is None:
-                    error = "No pending review to approve."
-                else:
-                    target_path = (workspace_path / self.pending_review["file_path"]).resolve()
-                    target_path.parent.mkdir(parents=True, exist_ok=True)
-                    target_path.write_text(self.pending_review["proposed"])
-                    current_file_content = self.pending_review["proposed"]
-                    print(
-                        f"[HITL] Human approved change for '{self.pending_review['file_path']}'.",
-                        flush=True,
-                    )
-                    self.pending_review = None
-                    reward = 0.1
-                    info["human_approved"] = True
-
-            # ✅ CHANGE 4: New action — human_rejected
-            elif action.action_type == "human_rejected":
-                if self.pending_review is None:
-                    error = "No pending review to reject."
-                else:
-                    rejected_file = self.pending_review["file_path"]
-                    self.pending_review = None
-                    error = f"Human rejected the proposed change to '{rejected_file}'. Please revise."
-                    reward = 0.01
-                    info["human_rejected"] = True
-                    print(f"[HITL] Human rejected change for '{rejected_file}'.", flush=True)
+            # ✅ RESTRUCTURED: HITL approval is now POST-SUBMIT ONLY (removed mid-episode request_human_review)
 
             elif action.action_type == "run_tests":
                 result = subprocess.run(
@@ -506,13 +461,84 @@ class JiraToCodeEnv(Environment):
                 )
                 test_output = result.stdout + "\n" + result.stderr
                 passed, total = self._parse_pytest_results(test_output)
-                done = True
 
                 if result.returncode == 0:
-                    reward = 1.0
-                    # ✅ CHANGE 5: Knowledge capture only fires after tests pass.
-                    # In HITL mode, the human already approved the fix before submit,
-                    # so this is both test-verified AND human-approved.
+                    # ✅ RESTRUCTURED: All tests passed — pause for final HITL approval
+                    # Emit before/after summary for every file the agent changed
+                    import json as _json
+                    for file_path, fixed_content in self.fixed_files.items():
+                        original_content = self.original_files.get(file_path, "")
+                        summary_payload = _json.dumps({
+                            "file_path": file_path,
+                            "original": original_content,
+                            "fixed": fixed_content,
+                            "tests_passed": True,
+                            "passed": passed,
+                            "total": total,
+                        }, separators=(",", ":"))
+                        print(f"[FIX_SUMMARY] {summary_payload}", flush=True)
+
+                    # Create pending review for HITL approval
+                    if self.fixed_files:
+                        # Build a combined diff of all changes
+                        combined_diff_parts = []
+                        for file_path, fixed_content in self.fixed_files.items():
+                            original_content = self.original_files.get(file_path, "")
+                            diff_text = self._compute_diff(original_content, fixed_content, file_path)
+                            combined_diff_parts.append(diff_text)
+                        combined_diff = "\n".join(combined_diff_parts)
+                    else:
+                        combined_diff = "(no changes detected)"
+
+                    self.pending_review = {
+                        "test_results": {"passed": passed, "total": total},
+                        "diff": combined_diff,
+                        "fixed_files": dict(self.fixed_files),
+                        "test_output": test_output,
+                    }
+                    reward = 0.9
+                    info["awaiting_human_review"] = True
+                    done = False
+                    print(
+                        f"[HITL] All tests passed ({passed}/{total}). "
+                        f"Pausing for final human approval before persisting changes.",
+                        flush=True,
+                    )
+                else:
+                    # Tests failed — end episode immediately without HITL
+                    done = True
+                    reward = 0.5 * (passed / total)
+                    print(
+                        f"[HITL] Submit failed: {passed}/{total} tests passed. "
+                        f"Episode ended without HITL review.",
+                        flush=True,
+                    )
+
+            # ✅ RESTRUCTURED: New action — human_approved_final
+            elif action.action_type == "human_approved_final":
+                if self.pending_review is None:
+                    error = "No pending review to approve."
+                else:
+                    # Write all approved files back to the SOURCE task directory
+                    fixed_files_to_persist = self.pending_review.get("fixed_files", {})
+                    for file_path, approved_content in fixed_files_to_persist.items():
+                        if self.task_source_dir:
+                            source_target = (self.task_source_dir / file_path).resolve()
+                            try:
+                                source_target.relative_to(self.task_source_dir)
+                                source_target.parent.mkdir(parents=True, exist_ok=True)
+                                source_target.write_text(approved_content)
+                                print(
+                                    f"[HITL] Fix approved and saved: '{source_target}'",
+                                    flush=True,
+                                )
+                            except ValueError:
+                                print(
+                                    f"[HITL] Warning: could not resolve source path for '{file_path}'",
+                                    flush=True,
+                                )
+
+                    # ✅ CHANGE 5: Capture knowledge now that human has approved
                     submitted_code = action.content or ""
                     if not submitted_code and self.workspace_dir:
                         for py_file in Path(self.workspace_dir).rglob("*.py"):
@@ -523,10 +549,25 @@ class JiraToCodeEnv(Environment):
                                     break
                                 except Exception:
                                     pass
-                    # Teacher LLM summarises → vectorised into corporate_memory
                     self._capture_knowledge(self.jira_ticket, submitted_code)
+
+                    self.pending_review = None
+                    reward = 1.0
+                    done = True
+                    info["human_approved_final"] = True
+                    print(f"[HITL] Final approval granted. Episode complete.", flush=True)
+
+            # ✅ RESTRUCTURED: New action — human_rejected_final
+            elif action.action_type == "human_rejected_final":
+                if self.pending_review is None:
+                    error = "No pending review to reject."
                 else:
-                    reward = 0.5 * (passed / total)
+                    self.pending_review = None
+                    error = "Human rejected the final solution. Tests passed but changes were not approved."
+                    reward = 0.01
+                    done = True
+                    info["human_rejected_final"] = True
+                    print(f"[HITL] Final approval denied. Changes discarded.", flush=True)
 
         except subprocess.TimeoutExpired:
             error = "Tests timed out after 30 seconds."

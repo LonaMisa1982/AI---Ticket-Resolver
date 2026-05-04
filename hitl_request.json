@@ -1,0 +1,6 @@
+{
+  "file_path": "orm.py",
+  "original": "from django.db.models import Prefetch\nclass User:\n    def __init__(self, id): self.id = id\nclass DB:\n    def get_users(self): return [User(i) for i in range(50)]\n    def get_profile(self, user): return {'profile': 'data'}\n    def get_profile_list_prefetch(self, users):\n        return [\n            {\n                'user_id': user.id,\n                'profile': self.get_profile(user),\n            }\n            for user in users\n        ]\ndef fetch_user_profiles(db):\n    return db.get_profile_list_prefetch(db.get_users())",
+  "proposed": "from django.db.models import Prefetch\nclass User:\n    def __init__(self, id): self.id = id\nclass DB:\n    def get_users(self): return [User(i) for i in range(50)]\n    def get_profile(self, user): return {'profile': 'data'}\n    def get_profile_list_prefetch(self, users):\n        return [\n            {\n                'user_id': user.id,\n                'profile': self.get_profile(user),\n            }\n            for user in users\n        ]\ndef fetch_user_profiles(db):\n    return db.get_profile_list_prefetch(db.get_users())",
+  "diff": "(no changes detected)"
+}

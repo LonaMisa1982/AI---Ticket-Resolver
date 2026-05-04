@@ -218,6 +218,28 @@ hr { border-color: #21262d !important; }
 )
 
 # ---------------------------------------------------------------------------
+# Token loading — secure, from file instead of UI input
+# ---------------------------------------------------------------------------
+
+@st.cache_resource
+def _load_hf_token() -> str:
+    """Load HF token securely from ./token file."""
+    token_file = Path("./token")
+    if token_file.exists():
+        try:
+            token = token_file.read_text().strip()
+            if token:
+                return token
+        except Exception as exc:
+            print(f"[WARNING] Could not read token file: {exc}", flush=True)
+    # Fallback to env var if token file doesn't exist
+    fallback = os.getenv("HF_TOKEN", "")
+    if not fallback:
+        print("[WARNING] No HF_TOKEN found. Please create a ./token file or set HF_TOKEN env var.", flush=True)
+    return fallback
+
+
+# ---------------------------------------------------------------------------
 # Lazy imports — kept here so Streamlit loads even if env isn't set up
 # ---------------------------------------------------------------------------
 
@@ -344,17 +366,18 @@ def _render_diff_html(diff_text: str) -> str:
 # ---------------------------------------------------------------------------
 
 _LOG_PATTERNS = {
-    "start":   re.compile(r"\[START\]\s+task=(\S+)\s+env=(\S+)\s+model=(\S+)"),
-    "step":    re.compile(
+    "start":        re.compile(r"\[START\]\s+task=(\S+)\s+env=(\S+)\s+model=(\S+)"),
+    "step":         re.compile(
         r"\[STEP\]\s+step=(\d+)\s+action=(\S+)\s+reward=([\d.]+)\s+done=(\S+)\s+error=(\S+)"
     ),
-    "end":     re.compile(
+    "end":          re.compile(
         r"\[END\]\s+success=(\S+)\s+steps=(\d+)\s+score=([\d.]+)\s+rewards=([\d.,]+)"
     ),
-    "thought": re.compile(r"\[THOUGHT\]\s+step=(\d+)\s+thought=(.+)"),
-    "kb":      re.compile(r"\[KB\](.+)"),
-    "mapper":  re.compile(r"\[MAPPER\](.+)"),
-    "hitl":    re.compile(r"\[HITL\](.+)"),        # ✅ CHANGE 4: HITL log lines
+    "thought":      re.compile(r"\[THOUGHT\]\s+step=(\d+)\s+thought=(.+)"),
+    "kb":           re.compile(r"\[KB\](.+)"),
+    "mapper":       re.compile(r"\[MAPPER\](.+)"),
+    "hitl":         re.compile(r"\[HITL\](.+)"),
+    "fix_summary":  re.compile(r"\[FIX_SUMMARY\]\s+(.+)"),   # JSON payload
 }
 
 
@@ -390,6 +413,12 @@ def parse_log_line(line: str) -> Optional[dict]:
                 return {"kind": "mapper", "msg": m.group(1).strip()}
             elif kind == "hitl":
                 return {"kind": "hitl", "msg": m.group(1).strip()}
+            elif kind == "fix_summary":
+                try:
+                    payload = json.loads(m.group(1).strip())
+                    return {"kind": "fix_summary", "payload": payload}
+                except Exception:
+                    return None
     return None
 
 
@@ -447,7 +476,7 @@ def render_step_card(step_data: dict):
     is_hitl = "request_human_review" in action
     card_cls = "done" if done else ("hitl" if is_hitl else ("error" if error else ""))
     rc = _reward_class(reward)
-    action_html = _action_badge(action.split("{")[0][:30])
+    action_html = _action_badge(action[:40])
 
     thought_html = (
         f'<div class="step-label">Thought</div>'
@@ -493,28 +522,153 @@ def render_hint_cards(hints):
         )
 
 
+def _escape_html(text: str) -> str:
+    return (
+        text.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+    )
+
+
+def render_fix_summary(summaries: list):
+    """Render a before/after side-by-side panel for every file the agent changed."""
+    if not summaries:
+        return
+
+    st.markdown("---")
+    st.markdown("### 🔬 Bug Fix — Before & After")
+
+    for fix in summaries:
+        file_path = fix.get("file_path", "unknown")
+        original  = fix.get("original", "")
+        fixed     = fix.get("fixed", "")
+        passed    = fix.get("tests_passed", False)
+        n_passed  = fix.get("passed", 0)
+        n_total   = fix.get("total", 0)
+
+        status_color = "#3fb950" if passed else "#d29922"
+        status_label = (
+            f"✅ All {n_total} tests passed"
+            if passed
+            else f"⚠️ {n_passed}/{n_total} tests passed"
+        )
+
+        # Compute a line-level diff to highlight changed lines
+        import difflib
+        orig_lines  = original.splitlines()
+        fixed_lines = fixed.splitlines()
+
+        diff = list(difflib.unified_diff(orig_lines, fixed_lines, lineterm="", n=0))
+        removed = set()
+        added   = set()
+        orig_line_no  = 0
+        fixed_line_no = 0
+        for dline in diff:
+            if dline.startswith("@@"):
+                # Parse hunk header e.g. @@ -3,4 +3,5 @@
+                import re as _re
+                m = _re.search(r"-(\d+)(?:,\d+)? \+(\d+)(?:,\d+)?", dline)
+                if m:
+                    orig_line_no  = int(m.group(1)) - 1
+                    fixed_line_no = int(m.group(2)) - 1
+            elif dline.startswith("-"):
+                removed.add(orig_line_no)
+                orig_line_no += 1
+            elif dline.startswith("+"):
+                added.add(fixed_line_no)
+                fixed_line_no += 1
+            else:
+                orig_line_no  += 1
+                fixed_line_no += 1
+
+        def _render_code_with_highlights(lines, highlight_lines, add_color, bg_color):
+            html_parts = []
+            for i, line in enumerate(lines):
+                escaped = _escape_html(line)
+                if i in highlight_lines:
+                    html_parts.append(
+                        f'<div style="background:{bg_color}; color:{add_color}; '
+                        f'padding:0 4px; white-space:pre; font-family:JetBrains Mono,monospace; '
+                        f'font-size:0.78rem; line-height:1.7;">{escaped}</div>'
+                    )
+                else:
+                    html_parts.append(
+                        f'<div style="white-space:pre; font-family:JetBrains Mono,monospace; '
+                        f'font-size:0.78rem; line-height:1.7; padding:0 4px;">{escaped}</div>'
+                    )
+            return "".join(html_parts)
+
+        orig_html  = _render_code_with_highlights(orig_lines,  removed, "#f85149", "#2d1515")
+        fixed_html = _render_code_with_highlights(fixed_lines, added,   "#3fb950", "#122612")
+
+        col_before, col_after = st.columns(2)
+
+        with col_before:
+            st.markdown(
+                f'<div style="font-family:Space Grotesk,sans-serif; font-size:0.75rem; '
+                f'text-transform:uppercase; letter-spacing:1px; color:#f85149; '
+                f'margin-bottom:6px;">🐛 Buggy — {_escape_html(file_path)}</div>',
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f'<div style="background:#0d1117; border:1px solid #30363d; '
+                f'border-left:3px solid #f85149; border-radius:6px; padding:12px; '
+                f'max-height:480px; overflow-y:auto; color:#c9d1d9;">'
+                f'{orig_html}</div>',
+                unsafe_allow_html=True,
+            )
+
+        with col_after:
+            st.markdown(
+                f'<div style="font-family:Space Grotesk,sans-serif; font-size:0.75rem; '
+                f'text-transform:uppercase; letter-spacing:1px; color:#3fb950; '
+                f'margin-bottom:6px;">✅ Fixed — {_escape_html(file_path)}</div>',
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f'<div style="background:#0d1117; border:1px solid #30363d; '
+                f'border-left:3px solid #3fb950; border-radius:6px; padding:12px; '
+                f'max-height:480px; overflow-y:auto; color:#c9d1d9;">'
+                f'{fixed_html}</div>',
+                unsafe_allow_html=True,
+            )
+
+        st.markdown(
+            f'<div style="text-align:center; margin:8px 0 16px; font-family:Space Grotesk,sans-serif; '
+            f'font-size:0.88rem; color:{status_color};">{status_label}</div>',
+            unsafe_allow_html=True,
+        )
+
+
 # ---------------------------------------------------------------------------
 # ✅ CHANGE 4: HITL Review Panel
 # ---------------------------------------------------------------------------
 
 def render_hitl_panel(review: dict, hitl_placeholder):
-    """Render the approve/reject gate inside *hitl_placeholder*."""
+    """Render the final approval gate for the completed solution."""
     diff_html = _render_diff_html(review.get("diff", "(no diff available)"))
-    file_path = review.get("file_path", "unknown file")
+    test_results = review.get("test_results", {})
+    passed = test_results.get("passed", 0)
+    total = test_results.get("total", 1)
+    fixed_files_list = list(review.get("fixed_files", {}).keys())
 
     with hitl_placeholder.container():
         st.markdown(
             f"""
 <div class="hitl-panel">
-  <div class="hitl-title">🔍 Human Review Required</div>
+  <div class="hitl-title">✅ Final Approval Required</div>
   <p style="color:#c9d1d9; font-size:0.9rem">
-    The agent is proposing the following change to <strong>{file_path}</strong>.
-    Please review the diff and approve or reject.
+    All tests passed ({passed}/{total}). The agent has completed the task successfully.
+    Please review the changes and approve or reject before they are persisted.
+  </p>
+  <p style="color:#8b949e; font-size:0.85rem; margin-top:8px;">
+    <strong>Files changed:</strong> {', '.join(fixed_files_list) if fixed_files_list else 'None'}
   </p>
 </div>""",
             unsafe_allow_html=True,
         )
 
+        st.markdown("**Code Changes:**")
         st.markdown(
             f'<div class="diff-view">{diff_html}</div>',
             unsafe_allow_html=True,
@@ -522,16 +676,14 @@ def render_hitl_panel(review: dict, hitl_placeholder):
 
         col_approve, col_reject, _ = st.columns([1, 1, 4])
         with col_approve:
-            if st.button("✅ Approve Fix", key="hitl_approve", use_container_width=True):
+            if st.button("✅ Approve & Persist", key="hitl_approve", use_container_width=True):
                 _write_hitl_response("approved")
                 st.session_state.pending_hitl = None
-                st.session_state.hitl_decided = True
                 st.rerun()
         with col_reject:
-            if st.button("❌ Reject Fix", key="hitl_reject", use_container_width=True):
+            if st.button("❌ Reject & Discard", key="hitl_reject", use_container_width=True):
                 _write_hitl_response("rejected")
                 st.session_state.pending_hitl = None
-                st.session_state.hitl_decided = True
                 st.rerun()
 
 
@@ -553,7 +705,8 @@ def _init_state():
         "custom_ticket": "",
         # ✅ CHANGE 4: HITL state
         "pending_hitl": None,   # dict from hitl_request.json while awaiting human
-        "hitl_decided": False,  # flag so we don't re-render the panel after decision
+        # Before/after file comparison shown in end summary
+        "fix_summaries": [],    # list of {file_path, original, fixed, tests_passed}
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -597,7 +750,10 @@ with st.sidebar:
     st.markdown("### 🤖 Agent Config")
     api_base = st.text_input("API Base URL", value=os.getenv("API_BASE_URL", "https://router.huggingface.co/v1"))
     model_name = st.text_input("Model", value=os.getenv("MODEL_NAME", "Qwen/Qwen2.5-7B-Instruct"))
-    hf_token = st.text_input("HF Token / API Key", value=os.getenv("HF_TOKEN", ""), type="password")
+
+    # ✅ SECURE: HF Token loaded from ./token file, not exposed in UI
+    hf_token = _load_hf_token()
+    st.caption("🔒 API Key loaded securely from ./token file")
 
     # ✅ CHANGE 4: HITL toggle
     hitl_enabled = st.toggle("Enable HITL (Human-in-the-Loop)", value=True)
@@ -705,7 +861,7 @@ if run_btn and not st.session_state.running:
     st.session_state.start_info = None
     st.session_state.thoughts = {}
     st.session_state.pending_hitl = None
-    st.session_state.hitl_decided = False
+    st.session_state.fix_summaries = []
     st.session_state.running = True
 
     env_vars = os.environ.copy()
@@ -736,22 +892,23 @@ if run_btn and not st.session_state.running:
     st.session_state.thread = t
 
 # ---------------------------------------------------------------------------
-# ✅ CHANGE 4: Poll for HITL request file while agent is running
+# ✅ RESTRUCTURED: HITL approval is now POST-SUBMIT ONLY
+# Only shown after the episode completes with all tests passing
 # ---------------------------------------------------------------------------
 
-if st.session_state.running or st.session_state.pending_hitl:
-    # Check if inference.py has written a review request
-    if st.session_state.pending_hitl is None and not st.session_state.hitl_decided:
+# Render HITL gate only when episode is done and tests passed
+if st.session_state.end_info and st.session_state.end_info.get("success"):
+    if st.session_state.pending_hitl is None:
+        # Load the HITL request from inference.py
         review = _load_hitl_request()
         if review:
             st.session_state.pending_hitl = review
 
-# Render HITL gate if pending (blocks step polling until resolved)
+# Show HITL panel if pending (only after successful episode)
 if st.session_state.pending_hitl:
     render_hitl_panel(st.session_state.pending_hitl, hitl_placeholder)
 else:
     hitl_placeholder.empty()
-    st.session_state.hitl_decided = False   # reset for next round
 
 # ---------------------------------------------------------------------------
 # Poll log queue and update UI
@@ -790,6 +947,8 @@ if st.session_state.running:
                 elif parsed["kind"] == "end":
                     st.session_state.end_info = parsed
                     st.session_state.running = False
+                elif parsed["kind"] == "fix_summary":
+                    st.session_state.fix_summaries.append(parsed["payload"])
                 elif parsed["kind"] == "hitl":
                     # Log HITL events into raw logs (already done above)
                     pass
@@ -838,6 +997,10 @@ if st.session_state.end_info:
 </div>""",
         unsafe_allow_html=True,
     )
+
+# Render before/after for every file the agent changed (always, once end is known)
+if st.session_state.end_info and st.session_state.fix_summaries:
+    render_fix_summary(st.session_state.fix_summaries)
 
 # ---------------------------------------------------------------------------
 # Render step cards if not currently running (persisted state)

@@ -33,6 +33,8 @@ htmlcov/
 .env
 .env.*
 *.local
+token
+token.*
 
 # Logs
 *.log
@@ -49,4 +51,4 @@ implementation_plan.md
 task.md
 walkthrough.md
 72b_eval.txt
-token 
+

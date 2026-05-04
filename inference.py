@@ -495,7 +495,7 @@ def run_agent_episode(
 
             try:
                 action = parse_action(raw_text)
-                action_log = action.model_dump_json()
+                action_log = action.action_type
 
                 try:
                     thought_data = extract_json(raw_text)
@@ -506,7 +506,7 @@ def run_agent_episode(
                     pass
             except Exception as exc:
                 action = JiraCodeAction(action_type="list_files")
-                action_log = f"PARSE_ERROR: {exc}"
+                action_log = "PARSE_ERROR"
                 messages.append({
                     "role": "user",
                     "content": (
@@ -520,46 +520,11 @@ def run_agent_episode(
             obs, reward, done, info = env.step(action)
             error = obs.error
 
-            # ✅ CHANGE 4: HITL Approval Gate
-            # If the agent requested a review, pause and wait for human decision.
-            if info.get("awaiting_human_review") and env.pending_review is not None:
-                if hitl_enabled:
-                    # Write the diff to disk so Streamlit can display it
-                    write_hitl_request(env.pending_review)
-                    print("[HITL] Waiting for human to approve or reject…", flush=True)
-                    decision = poll_hitl_response()
-                else:
-                    # Batch / CLI mode: auto-approve
-                    decision = "approved"
-                    print("[HITL] HITL disabled — auto-approving change.", flush=True)
-
-                if decision == "approved":
-                    approval_action = JiraCodeAction(action_type="human_approved")
-                    obs, reward, done, info = env.step(approval_action)
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            "HITL: Your proposed change was APPROVED by the human reviewer "
-                            "and has been written to disk. Continue with testing and submission."
-                        ),
-                    })
-                else:
-                    rejection_action = JiraCodeAction(action_type="human_rejected")
-                    obs, reward, done, info = env.step(rejection_action)
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            "HITL: Your proposed change was REJECTED by the human reviewer. "
-                            "Please reconsider your approach and propose a revised fix."
-                        ),
-                    })
-
             reward = max(reward, 0.01)
             rewards.append(reward)
             steps_taken = step
 
-            safe_action_str = action_log.replace('\n', '\\n').replace('\r', '')
-            log_step(step=step, action=safe_action_str, reward=reward, done=done, error=error)
+            log_step(step=step, action=action_log, reward=reward, done=done, error=error)
 
             if done:
                 break
@@ -582,6 +547,34 @@ def run_agent_episode(
 
         score = min(max(sum(rewards), 0.01), 0.99)
         success = score >= SUCCESS_SCORE_THRESHOLD
+
+        # ✅ RESTRUCTURED: HITL Approval Gate — only after successful submit
+        # If the agent submitted with all tests passing, pause for final human review
+        if env.pending_review is not None and info.get("awaiting_human_review"):
+            print("[HITL] Waiting for final human approval of the completed solution…", flush=True)
+            
+            if hitl_enabled:
+                # Write the diff to disk so Streamlit can display it
+                write_hitl_request(env.pending_review)
+                print("[HITL] Waiting for human to approve or reject the final solution…", flush=True)
+                decision = poll_hitl_response()
+            else:
+                # Batch / CLI mode: auto-approve
+                decision = "approved"
+                print("[HITL] HITL disabled — auto-approving final solution.", flush=True)
+
+            if decision == "approved":
+                approval_action = JiraCodeAction(action_type="human_approved_final")
+                obs, reward, done, info = env.step(approval_action)
+                success = True
+                score = min(max(sum(rewards) + reward, 0.01), 0.99)
+                print("[HITL] Final approval granted. Solution persisted.", flush=True)
+            else:
+                rejection_action = JiraCodeAction(action_type="human_rejected_final")
+                obs, reward, done, info = env.step(rejection_action)
+                success = False
+                score = min(max(sum(rewards) + reward, 0.01), 0.99)
+                print("[HITL] Final approval denied. Changes not persisted.", flush=True)
 
     finally:
         env.close()
