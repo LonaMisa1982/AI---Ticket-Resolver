@@ -450,7 +450,8 @@ def run_agent_episode(
         # ------------------------------------------------------------------
         system_prompt = build_reducer_system_prompt(focus_files, kb_hints)
 
-        task_max_steps = 10 if "easy" in task_name else 20
+        # ✅ INCREASED STEP LIMITS: Easy tasks need more steps for exploration + fixing + testing
+        task_max_steps = 15 if "easy" in task_name else 25
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -526,7 +527,8 @@ def run_agent_episode(
 
             log_step(step=step, action=action_log, reward=reward, done=done, error=error)
 
-            if done:
+            # ✅ BREAK on completion OR when awaiting HITL approval
+            if done or info.get("awaiting_human_review"):
                 break
 
             obs_message = build_observation_message(step, obs, reward)
@@ -545,6 +547,14 @@ def run_agent_episode(
 
             messages.append({"role": "user", "content": obs_message})
 
+        # ✅ CHECK: Did the agent complete the task, or hit the step limit?
+        if not done:
+            print(
+                f"[WARNING] Agent reached step limit ({steps_taken}/{task_max_steps}) "
+                f"without calling submit(). Episode may be incomplete.",
+                flush=True,
+            )
+
         score = min(max(sum(rewards), 0.01), 0.99)
         success = score >= SUCCESS_SCORE_THRESHOLD
 
@@ -556,6 +566,11 @@ def run_agent_episode(
             if hitl_enabled:
                 # Write the diff to disk so Streamlit can display it
                 write_hitl_request(env.pending_review)
+                # ✅ FIX: Emit a structured log line BEFORE blocking so Streamlit
+                # can detect the pending review while the subprocess is still alive.
+                import json as _json
+                pending_payload = _json.dumps(env.pending_review, separators=(",", ":"))
+                print(f"[HITL_PENDING] {pending_payload}", flush=True)
                 print("[HITL] Waiting for human to approve or reject the final solution…", flush=True)
                 decision = poll_hitl_response()
             else:

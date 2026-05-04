@@ -378,6 +378,7 @@ _LOG_PATTERNS = {
     "mapper":       re.compile(r"\[MAPPER\](.+)"),
     "hitl":         re.compile(r"\[HITL\](.+)"),
     "fix_summary":  re.compile(r"\[FIX_SUMMARY\]\s+(.+)"),   # JSON payload
+    "hitl_pending": re.compile(r"\[HITL_PENDING\]\s+(.+)"),  # JSON payload — fires BEFORE blocking
 }
 
 
@@ -417,6 +418,12 @@ def parse_log_line(line: str) -> Optional[dict]:
                 try:
                     payload = json.loads(m.group(1).strip())
                     return {"kind": "fix_summary", "payload": payload}
+                except Exception:
+                    return None
+            elif kind == "hitl_pending":
+                try:
+                    payload = json.loads(m.group(1).strip())
+                    return {"kind": "hitl_pending", "payload": payload}
                 except Exception:
                     return None
     return None
@@ -896,15 +903,17 @@ if run_btn and not st.session_state.running:
 # Only shown after the episode completes with all tests passing
 # ---------------------------------------------------------------------------
 
-# Render HITL gate only when episode is done and tests passed
-if st.session_state.end_info and st.session_state.end_info.get("success"):
-    if st.session_state.pending_hitl is None:
-        # Load the HITL request from inference.py
-        review = _load_hitl_request()
-        if review:
-            st.session_state.pending_hitl = review
+# ✅ FIX: Show HITL panel whenever pending, including while agent subprocess is
+# still blocking on poll_hitl_response() (running=True, no end_info yet).
+# The old guard `end_info and end_info["success"]` prevented the panel from
+# ever appearing because end_info arrives only AFTER HITL resolves.
+if st.session_state.pending_hitl is None and not st.session_state.running:
+    # Fallback: try loading from file for page-reload recovery
+    review = _load_hitl_request()
+    if review:
+        st.session_state.pending_hitl = review
 
-# Show HITL panel if pending (only after successful episode)
+# Show HITL panel if pending (shown during running AND after completion)
 if st.session_state.pending_hitl:
     render_hitl_panel(st.session_state.pending_hitl, hitl_placeholder)
 else:
@@ -949,6 +958,11 @@ if st.session_state.running:
                     st.session_state.running = False
                 elif parsed["kind"] == "fix_summary":
                     st.session_state.fix_summaries.append(parsed["payload"])
+                elif parsed["kind"] == "hitl_pending":
+                    # ✅ FIX: Agent is blocking for HITL review — show panel immediately
+                    # while the subprocess is still alive (running=True).
+                    if st.session_state.pending_hitl is None:
+                        st.session_state.pending_hitl = parsed["payload"]
                 elif parsed["kind"] == "hitl":
                     # Log HITL events into raw logs (already done above)
                     pass
@@ -968,11 +982,17 @@ if st.session_state.running:
 
             _refresh_metrics()
 
-            task_max = 10 if "easy" in selected_task else 20
+            # ✅ UPDATED: Match step limits in inference.py
+            task_max = 15 if "easy" in selected_task else 25
             progress = min(len(st.session_state.steps) / task_max, 1.0)
             progress_bar.progress(progress)
 
         if st.session_state.running:
+            time.sleep(0.5)
+            st.rerun()
+        elif st.session_state.pending_hitl:
+            # ✅ FIX: subprocess is blocking on HITL poll — keep Streamlit alive
+            # so the Approve/Reject buttons remain interactive.
             time.sleep(0.5)
             st.rerun()
 
